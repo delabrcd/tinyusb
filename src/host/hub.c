@@ -50,6 +50,11 @@ typedef struct {
   // uint16_t wHubCharacteristics;
 
   hub_port_status_response_t port_status;
+
+  // openrb: bitmask (bit = port number) of ports found already-connected during the
+  // post-config scan; attaches are fired after the scan to avoid control-xfer
+  // collision with enum_new_device.
+  uint8_t scan_connected_mask;
 } hub_interface_t;
 
 typedef struct {
@@ -270,6 +275,22 @@ bool hub_edpt_status_xfer(uint8_t daddr) {
 static void config_set_port_power (tuh_xfer_t* xfer);
 static void config_port_power_complete (tuh_xfer_t* xfer);
 
+// Status-processing states (used by process_new_status). Declared up here so the
+// config path can kick off the openrb post-config connection scan.
+enum {
+  STATE_IDLE = 0,
+  STATE_HUB_STATUS,
+  STATE_CLEAR_CHANGE,
+  STATE_CHECK_CONN,
+  STATE_COMPLETE,
+  // openrb: post-config scan for devices already connected before the host took
+  // over (e.g. a controller that survived a warm reset on a bus-powered hub whose
+  // ports never lost power -> no connection-change event is ever generated).
+  STATE_INITIAL_SCAN,         // get_status of a port during the scan
+  STATE_INITIAL_SCAN_CLEARED  // cleared conn-change after attaching a scanned port
+};
+static void process_new_status(tuh_xfer_t* xfer);
+
 bool hub_set_config(uint8_t daddr, uint8_t itf_num) {
   hub_interface_t* p_hub = get_hub_itf(daddr);
   TU_ASSERT(itf_num == p_hub->itf_num);
@@ -327,13 +348,20 @@ static void config_port_power_complete (tuh_xfer_t* xfer) {
   hub_interface_t* p_hub = get_hub_itf(daddr);
 
   if (xfer->setup->wIndex == p_hub->bNbrPorts) {
-    // All ports are power -> queue notification status endpoint and
-    // complete the SET CONFIGURATION
-    if (!hub_edpt_status_xfer(daddr)) {
-      TU_MESS_FAILED();
-      TU_BREAKPOINT();
-    }
+    // All ports powered -> complete the SET CONFIGURATION
     usbh_driver_set_config_complete(daddr, p_hub->itf_num);
+    // openrb: before starting normal change-driven polling, scan the ports for
+    // devices that are already connected with no pending change -- e.g. a
+    // controller that survived a warm reset on a hub whose ports never lost power.
+    // The scan synthesizes an attach for each and starts the status poll when done;
+    // fall back to plain polling if it can't be kicked off.
+    p_hub->scan_connected_mask = 0;
+    if (!hub_port_get_status(daddr, 1, NULL, process_new_status, STATE_INITIAL_SCAN)) {
+      if (!hub_edpt_status_xfer(daddr)) {
+        TU_MESS_FAILED();
+        TU_BREAKPOINT();
+      }
+    }
   } else {
     // power next port
     uint8_t const hub_port = (uint8_t) (xfer->setup->wIndex + 1);
@@ -344,13 +372,29 @@ static void config_port_power_complete (tuh_xfer_t* xfer) {
 //--------------------------------------------------------------------+
 // Connection Changes
 //--------------------------------------------------------------------+
-enum {
-  STATE_IDLE = 0,
-  STATE_HUB_STATUS,
-  STATE_CLEAR_CHANGE,
-  STATE_CHECK_CONN,
-  STATE_COMPLETE
-};
+// openrb: advance the post-config connection scan to the next port. When the last
+// port has been scanned, synthesize an attach for every port we found connected --
+// deferred until here so the scan's hub control transfers can't collide with
+// enum_new_device's own hub control transfer. Returns true if another scan transfer
+// was queued; false when done (caller then starts the interrupt status poll).
+static bool hub_scan_advance(uint8_t daddr, uint8_t port_num) {
+  hub_interface_t *p_hub = get_hub_itf(daddr);
+  if (port_num < p_hub->bNbrPorts) {
+    return hub_port_get_status(daddr, (uint8_t) (port_num + 1), NULL, process_new_status,
+                               STATE_INITIAL_SCAN);
+  }
+  for (uint8_t p = 1; p <= p_hub->bNbrPorts; p++) {
+    if (p_hub->scan_connected_mask & (uint8_t) (1u << p)) {
+      const hcd_event_t event = {
+        .rhport     = usbh_get_rhport(daddr),
+        .event_id   = HCD_EVENT_DEVICE_ATTACH,
+        .connection = {.hub_addr = daddr, .hub_port = p}
+      };
+      hcd_event_handler(&event, false);
+    }
+  }
+  return false;
+}
 
 static void process_new_status(tuh_xfer_t* xfer);
 
@@ -462,6 +506,26 @@ static void process_new_status(tuh_xfer_t* xfer) {
       processed = (event.event_id == HCD_EVENT_DEVICE_ATTACH);
       break;
     }
+
+    case STATE_INITIAL_SCAN:
+      // openrb: post-config scan. If a device is already connected on this port,
+      // remember it and clear any pending connection change (so the normal poll
+      // won't also enumerate it), then move on. The actual attaches are fired once
+      // the whole scan is done -- see hub_scan_advance() -- so they don't collide
+      // with enum_new_device's hub control transfer.
+      if (p_hub->port_status.status.connection) {
+        p_hub->scan_connected_mask |= (uint8_t) (1u << port_num);
+        processed = hub_port_clear_feature(daddr, port_num, HUB_FEATURE_PORT_CONNECTION_CHANGE,
+                                           process_new_status, STATE_INITIAL_SCAN_CLEARED);
+      } else {
+        processed = hub_scan_advance(daddr, port_num);
+      }
+      break;
+
+    case STATE_INITIAL_SCAN_CLEARED:
+      // openrb: change cleared for a connected port -> continue the scan
+      processed = hub_scan_advance(daddr, port_num);
+      break;
 
     case STATE_COMPLETE:
     default:
