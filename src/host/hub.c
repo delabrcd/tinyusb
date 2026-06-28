@@ -270,23 +270,6 @@ bool hub_edpt_status_xfer(uint8_t daddr) {
 static void config_set_port_power (tuh_xfer_t* xfer);
 static void config_port_power_complete (tuh_xfer_t* xfer);
 
-// Status-processing states (used by process_new_status). Declared up here so the
-// config path can kick off the openrb post-config connection scan.
-enum {
-  STATE_IDLE = 0,
-  STATE_HUB_STATUS,
-  STATE_CLEAR_CHANGE,
-  STATE_CHECK_CONN,
-  STATE_COMPLETE,
-  // openrb: post-config scan for devices already connected before the host took
-  // over (e.g. a controller that survived a warm reset on a bus-powered hub whose
-  // ports never lost power -> no connection-change event is ever generated).
-  STATE_INITIAL_SCAN,  // get_status of a port during the scan
-  STATE_SCAN_PWR_OFF,  // cleared PORT_POWER on a connected port -> now set it back
-  STATE_SCAN_PWR_ON    // PORT_POWER restored; a fresh connect change follows for the poll
-};
-static void process_new_status(tuh_xfer_t* xfer);
-
 bool hub_set_config(uint8_t daddr, uint8_t itf_num) {
   hub_interface_t* p_hub = get_hub_itf(daddr);
   TU_ASSERT(itf_num == p_hub->itf_num);
@@ -344,19 +327,13 @@ static void config_port_power_complete (tuh_xfer_t* xfer) {
   hub_interface_t* p_hub = get_hub_itf(daddr);
 
   if (xfer->setup->wIndex == p_hub->bNbrPorts) {
-    // All ports powered -> complete the SET CONFIGURATION
-    usbh_driver_set_config_complete(daddr, p_hub->itf_num);
-    // openrb: before starting normal change-driven polling, scan the ports for
-    // devices that are already connected with no pending change -- e.g. a
-    // controller that survived a warm reset on a hub whose ports never lost power.
-    // The scan synthesizes an attach for each and starts the status poll when done;
-    // fall back to plain polling if it can't be kicked off.
-    if (!hub_port_get_status(daddr, 1, NULL, process_new_status, STATE_INITIAL_SCAN)) {
-      if (!hub_edpt_status_xfer(daddr)) {
-        TU_MESS_FAILED();
-        TU_BREAKPOINT();
-      }
+    // All ports are power -> queue notification status endpoint and
+    // complete the SET CONFIGURATION
+    if (!hub_edpt_status_xfer(daddr)) {
+      TU_MESS_FAILED();
+      TU_BREAKPOINT();
     }
+    usbh_driver_set_config_complete(daddr, p_hub->itf_num);
   } else {
     // power next port
     uint8_t const hub_port = (uint8_t) (xfer->setup->wIndex + 1);
@@ -367,18 +344,13 @@ static void config_port_power_complete (tuh_xfer_t* xfer) {
 //--------------------------------------------------------------------+
 // Connection Changes
 //--------------------------------------------------------------------+
-// openrb: advance the post-config connection scan to the next port, or return false
-// when the last port is done (caller then starts the interrupt status poll). Ports
-// found connected are power-cycled in place (see STATE_INITIAL_SCAN) which raises a
-// real connection change that the normal poll path enumerates.
-static bool hub_scan_advance(uint8_t daddr, uint8_t port_num) {
-  hub_interface_t *p_hub = get_hub_itf(daddr);
-  if (port_num < p_hub->bNbrPorts) {
-    return hub_port_get_status(daddr, (uint8_t) (port_num + 1), NULL, process_new_status,
-                               STATE_INITIAL_SCAN);
-  }
-  return false;
-}
+enum {
+  STATE_IDLE = 0,
+  STATE_HUB_STATUS,
+  STATE_CLEAR_CHANGE,
+  STATE_CHECK_CONN,
+  STATE_COMPLETE
+};
 
 static void process_new_status(tuh_xfer_t* xfer);
 
@@ -490,33 +462,6 @@ static void process_new_status(tuh_xfer_t* xfer) {
       processed = (event.event_id == HCD_EVENT_DEVICE_ATTACH);
       break;
     }
-
-    case STATE_INITIAL_SCAN:
-      // openrb: post-config scan. A device already connected at this point (e.g. one
-      // that survived a warm reset on a bus-powered hub) generated no connection
-      // change, so the normal poll never enumerates it -- and a USB port reset of the
-      // stale device is unreliable. Power-cycle the port instead (CLEAR then SET
-      // PORT_POWER) to force a real disconnect/reconnect; the resulting fresh
-      // connection change is handled by the normal path, re-enumerating it like a
-      // replug.
-      if (p_hub->port_status.status.connection) {
-        processed = hub_port_clear_feature(daddr, port_num, HUB_FEATURE_PORT_POWER,
-                                           process_new_status, STATE_SCAN_PWR_OFF);
-      } else {
-        processed = hub_scan_advance(daddr, port_num);
-      }
-      break;
-
-    case STATE_SCAN_PWR_OFF:
-      // openrb: port powered off -> power it back on
-      processed = hub_port_set_feature(daddr, port_num, HUB_FEATURE_PORT_POWER,
-                                       process_new_status, STATE_SCAN_PWR_ON);
-      break;
-
-    case STATE_SCAN_PWR_ON:
-      // openrb: power restored -> continue scanning the remaining ports
-      processed = hub_scan_advance(daddr, port_num);
-      break;
 
     case STATE_COMPLETE:
     default:

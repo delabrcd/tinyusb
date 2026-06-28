@@ -1485,7 +1485,7 @@ static void process_enumeration(tuh_xfer_t* xfer) {
   static uint8_t failed_count = 0;
   if (XFER_RESULT_FAILED == xfer->result) {
     enum {
-      ATTEMPT_COUNT_MAX = 3,
+      ATTEMPT_COUNT_MAX = 6,
       ATTEMPT_DELAY_MS = 100
     };
 
@@ -1495,7 +1495,22 @@ static void process_enumeration(tuh_xfer_t* xfer) {
     if (retry) {
       tusb_time_delay_ms_api(ATTEMPT_DELAY_MS); // delay a bit
       TU_LOG_USBH("Enumeration attempt %u/%u\r\n", failed_count+1, ATTEMPT_COUNT_MAX);
-      retry = tuh_control_xfer(xfer);
+#if CFG_TUH_HUB
+      // OpenRB warm-reset recovery: a controller that survived a host warm reset
+      // can be frozen in its prior USB session (still bound to its old address) and
+      // ignore the single port reset, so the addr0 device-descriptor read gets no
+      // response. Re-issue the hub port reset on every attempt to keep trying to
+      // knock it back to address 0, instead of just re-sending the doomed control
+      // transfer to an address it isn't listening on.
+      tuh_bus_info_t* dev0_bus_retry = &_usbh_data.dev0_bus;
+      if (xfer->daddr == 0 && dev0_bus_retry->hub_addr != 0) {
+        retry = hub_port_reset(dev0_bus_retry->hub_addr, dev0_bus_retry->hub_port,
+                               process_enumeration, ENUM_HUB_GET_STATUS_AFTER_RESET);
+      } else
+#endif
+      {
+        retry = tuh_control_xfer(xfer);
+      }
     }
 
     if (!retry) {
